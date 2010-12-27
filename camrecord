@@ -1,0 +1,457 @@
+#!/usr/bin/perl
+
+use Getopt::Long;
+use Sys::Syslog;
+use IO::File;
+use Time::HiRes;
+use POSIX;
+use strict;
+local($^W) = 1;
+
+my $curl_bin = "/usr/bin/curl";
+my $ffmpeg_bin = "/usr/bin/ffmpeg";
+my $mencoder_bin = "/usr/bin/mencoder";
+my $ps_bin = "/bin/ps";
+my $pipe_buffer_size = 262144; # 30 seconds is approx 10 MB in low light, so 256K is about 3/4 of a second, which allows for the while loop to be responsive. in normal light, 256K will be shorter than 3/4 of a second.
+my $time_increment = 30; # practical values are 30 and 60. Higher = more memory use, but fewer temp files.
+my $SIGKILL = 9;
+my @valid_config_option_list = (qw(connect_timeout read_timeout temp_clip_dir final_output_dir camera_type camera_mac_addr camera_ip_addr camera_username camera_password const_rate_factor)); # list of valid config file options.
+my $connect_timeout = 15; # timeout of curl connect. prevents hanging process. specifies default if omitted from config.
+my $read_timeout = 10; # timeout of read from curl process. prevents hanging process. specifies default if omitted from config.
+my $temp_clip_dir; # dir for 30 second clips.
+my $final_output_dir; # dir for four hour AVI files.
+my @valid_camera_type_list = (qw(axis_206 axis_207 axis_210 trendnet_tvip110));
+my $camera_type;
+my $camera_mac_addr;
+my $camera_ip_addr;
+my $camera_username = ""; # default is no username
+my $camera_password = ""; # default is no password
+my $const_rate_factor = "26.5"; # FFmpeg constant rate factor for x264 codec. default is 26.5.
+my $daemon = 0; # if set to 1, then runs in the background and disassociates from terminal.
+my $writepid_filename = ""; # if blank, do not write PID.
+
+main();
+
+sub main {
+  local $SIG{"ALRM"} = sub { die "alarm\n"; };
+  local $SIG{"CHLD"} = "IGNORE"; # automatically reap child processes.
+  local $SIG{"TERM"} = \&log_then_exit; # if TERM sig, first log the event, then exit.
+  my $config_filename = "";
+  GetOptions("config=s" => \$config_filename, "daemon" => \$daemon, "writepid=s" => \$writepid_filename);
+  parse_config($config_filename);
+  openlog("camrecord", "ndelay,pid", "user");
+  if ($daemon) {
+    my $child_pid = fork();
+    if (!defined($child_pid)) {
+      # fork return result is positive number (child PID) for parent process, 0 for child process.
+      # fork returns undef if the fork was unsuccessful.
+      log_event("err", "problem forking child: $!");
+      exit(1);
+    }
+    if ($child_pid) {
+      # parent process, so exit
+      exit();
+    }
+    # detach from controlling terminal and create new session ID and parent group ID.
+    daemonize();
+  }
+  if ($writepid_filename) {
+    my $pid_fh = IO::File->new();
+    $pid_fh->open(">$writepid_filename");
+    print $pid_fh $$;
+    print $pid_fh "\n";
+    $pid_fh->close();
+  }
+  if (!-d "$temp_clip_dir/$camera_mac_addr") {
+    mkdir("$temp_clip_dir/$camera_mac_addr", 0755);
+  }
+  if (!-d "$final_output_dir/$camera_mac_addr") {
+    mkdir("$final_output_dir/$camera_mac_addr", 0755);
+  }
+  my $camera_io_handle = IO::File->new();
+  my $pipe_child_pid;
+  my $last_combine_timestamp = 0;
+  while(1) {
+    $pipe_child_pid = open_camera_pipe($camera_io_handle); # open pipe to camera based on camera type and other options.
+    my $camera_data = "";
+    my $unprocessed_data = "";
+    my $time_marker = Time::HiRes::time();
+    eval {
+      alarm($read_timeout);
+      # keep pipe_buffer_size small enough so that the read takes less than about 1 second, in order to loop through once per second at least.
+      while ($camera_io_handle->read($camera_data, $pipe_buffer_size, length($camera_data))) {
+	alarm(0);
+	if (Time::HiRes::time() - $time_marker >= $time_increment) {
+	  my $duration = Time::HiRes::time() - $time_marker;
+	  $time_marker = Time::HiRes::time();
+	  transcode_mjpeg_to_avi(\$camera_data, $duration, \$unprocessed_data);
+	  $camera_data = $unprocessed_data;
+	  $unprocessed_data = "";
+	  # perform check about whether to do combine operation.
+	  # Do the check only once every time_increment seconds because more efficient and do not need extra granularity.
+	  my $current_timestamp = time();
+	  my ($now_min) = (localtime($current_timestamp))[1];
+	  if (($now_min >= 10) && ($now_min <= 15) && (($current_timestamp - $last_combine_timestamp) > 900)) {
+	    # if 10 minutes past the hour and last combine operation was more than 15 minutes ago, perform another combine.
+	    combine_avi_segments();
+	    $last_combine_timestamp = $current_timestamp;
+	  }
+	}
+	alarm($read_timeout); # reinstall alarm to put time limit on read action in while loop.
+      }
+      alarm(0);
+    };
+    if ($@) {
+      kill($SIGKILL, $pipe_child_pid);
+      $camera_io_handle->close();
+      if ($@ eq "alarm\n") {
+	# alarm interrupt, so process current contents of $camera_data and then loop to try to read more.
+	log_event("notice", "curl read timeout ($read_timeout seconds); closing and reopening pipe");
+	if ($camera_data) {
+	  my $duration = Time::HiRes::time() - $time_marker;
+	  $time_marker = Time::HiRes::time();
+	  transcode_mjpeg_to_avi(\$camera_data, $duration, \$unprocessed_data);
+	  $camera_data = $unprocessed_data;
+	  $unprocessed_data = "";
+	}
+      } else {
+	log_event("err", "unknown exception (not curl read timeout); exiting");
+	log_event("err", $@);
+	die; # if alarm didn't throw exception, then die (rethrow the exception).
+      }
+    } else {
+      # curl exited (camera closed connection, curl crashed, or other reasons possible).
+      # if any data remaining in $camera_data, process it.
+      $camera_io_handle->close();
+      log_event("notice", "curl exited and closed pipe; reopening pipe");
+      if ($camera_data) {
+	my $duration = Time::HiRes::time() - $time_marker;
+	$time_marker = Time::HiRes::time();
+	transcode_mjpeg_to_avi(\$camera_data, $duration, \$unprocessed_data);
+	$camera_data = $unprocessed_data;
+	$unprocessed_data = "";
+      }
+    }
+  }
+}
+
+# open pipe to camera based on camera type and other options.
+sub open_camera_pipe($) {
+  my $camera_io_handle = shift;
+  my @curl_opt_list;
+  push(@curl_opt_list, "--connect-timeout $connect_timeout");
+  push(@curl_opt_list, "-s");
+  if ($camera_username) {
+    push(@curl_opt_list, "-u $camera_username:$camera_password");
+  }
+  my $camera_url;
+  if ($camera_type =~ /^axis_/) {
+    $camera_url = "http://$camera_ip_addr/axis-cgi/mjpg/video.cgi";
+  } elsif ($camera_type =~ /^trendnet_/) {
+    $camera_url = "http://$camera_ip_addr/cgi/mjpg/mjpg.cgi";
+  }
+  push(@curl_opt_list, $camera_url);
+  my $curl_opt_str = join(" ", @curl_opt_list);
+  my $pipe_child_pid;
+  my $is_pipe_opened = 0;
+  while(!$is_pipe_opened) {
+    eval {
+      alarm($connect_timeout + 3); # make perl timeout a few seconds more than connect_timeout to allow curl to exit by itself.
+      $pipe_child_pid = $camera_io_handle->open(qq{$curl_bin $curl_opt_str|});
+      $camera_io_handle->binmode();
+      alarm(0);
+    };
+    if ($@) {
+      # signal, so check type. if type is other than alarm, die.
+      if ($@ eq "alarm\n") {
+	log_event("notice", "connect timeout ($connect_timeout seconds) while opening pipe to curl; retrying");
+	# alarm caused signal, so kill child process, close handle, sleep briefly, and then retry open.
+	if ($pipe_child_pid) {
+	  kill($SIGKILL, $pipe_child_pid);
+	}
+	$camera_io_handle->close();
+	sleep(1); # sleep for a second before retrying open of curl process.
+      } else {
+	log_event("err", "problem (not timeout) opening pipe to curl; exiting");
+	log_event("err", $@);
+	die; # alarm did not cause exception, so die (rethrow the exception).
+      }
+    } else {
+      $is_pipe_opened = 1; # set flag to exit loop.
+      log_event("info", "opened pipe to curl targeting $camera_ip_addr");
+    }
+  }
+  return $pipe_child_pid;
+}
+
+# convert JPEG frames (from MJPEG stream) to AVI file.
+sub transcode_mjpeg_to_avi($$$) {
+  my ($camera_data_ref, $duration, $unprocessed_data_ref) = @_;
+  my $frame_count = 0;
+  $frame_count++ while ($$camera_data_ref =~ m{Content-Type: image/jpeg}gcs);
+  # 38 characters is --myboundary\r\nContent-Type: image/jpeg
+  my $last_frame_start = pos($$camera_data_ref) - 38;
+  if ($$camera_data_ref =~ m{\G.*?Content-Length: (\d+)\r\n\r\n(.*)$}gcs) {
+    my $last_frame_size = $1;
+    my $last_frame_data = $2;
+    if (length($last_frame_data) >= $last_frame_size) {
+      # there actually was a complete last frame, but data stream got cut off in the middle of (or before) the next Content-Type: image/jpeg.
+      # leave frame_count as is, but chop off the trailing data after the complete last frame.
+      # --myboundary\r\nContent-Type: image/jpeg\r\nContent-Length: xxx\r\n\r\n
+      # start of the last complete frame's JPEG is at 60 bytes plus the length of the xxx (Content-Length value).
+      my $unprocessed_data_start = $last_frame_start + 60 + length($last_frame_size) + $last_frame_size;
+      # chop off the partial frame and put it into the unprocessed bin.
+      $$unprocessed_data_ref = substr($$camera_data_ref, $unprocessed_data_start);
+      substr($$camera_data_ref, $unprocessed_data_start) = "";
+    } else {
+      # decrease frame count by one because last Content-Type did not contain a complete JPEG.
+      $frame_count--;
+      # chop off the partial frame and put it into the unprocessed bin.
+      $$unprocessed_data_ref = substr($$camera_data_ref, $last_frame_start);
+      substr($$camera_data_ref, $last_frame_start) = "";
+    }
+  } else {
+    # decrease frame count by one because last Content-Type did not contain a complete JPEG.
+    $frame_count--;
+    # chop off the partial frame and put it into the unprocessed bin.
+    $$unprocessed_data_ref = substr($$camera_data_ref, $last_frame_start);
+    substr($$camera_data_ref, $last_frame_start) = "";
+  }
+  if ($frame_count < 1) {
+    return;
+  }
+  my $camera_data_copy = $$camera_data_ref;
+  my $ffmpeg_child_pid = fork();
+  if (!defined($ffmpeg_child_pid)) {
+    # fork return result is positive number (child PID) for parent process, 0 for child process.
+    # fork returns undef if the fork was unsuccessful.
+    log_event("err", "problem forking ffmpeg child: $!");
+    die;
+  }
+  if ($ffmpeg_child_pid) {
+    # parent process, so return
+    return;
+  }
+  # start a new session so that this child can survive the parent being killed.
+  # lets us finish processing the current 30 second clip if the parent is killed with Ctrl-C (or if killed by other means).
+  daemonize();
+  my $frame_rate = int($frame_count / $duration * 100) / 100;
+  my $output_avi_file = "$temp_clip_dir/$camera_mac_addr/" . time() . ".avi";
+  my $ffmpeg_io_handle = IO::File->new();
+  $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -v 0 -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 $output_avi_file >/dev/null 2>&1});
+  print $ffmpeg_io_handle $camera_data_copy;
+  $ffmpeg_io_handle->close();
+  if (!$ffmpeg_child_pid) {
+    # child process should exit after sending data to FFmpeg.
+    # note that parent process should have returned to main sub a few lines before this, and would not have called ffmpeg.
+    exit();
+  }
+}
+
+# combine 30 second AVI segments into a 4 hour movie.
+sub combine_avi_segments() {
+  my $mencoder_child_pid = fork();
+  if (!defined($mencoder_child_pid)) {
+    # fork return result is positive number (child PID) for parent process, 0 for child process.
+    # fork returns undef if the fork was unsuccessful.
+    log_event("err", "problem forking mencoder child: $!");
+    die;
+  }
+  if ($mencoder_child_pid) {
+    # parent process, so return.
+    return;
+  }
+  # start a new session so that this child can survive the parent being killed.
+  # lets us finish processing the merge of all clips into 4 hour movie even if the parent is killed.
+  daemonize();
+  my ($now_hour, $now_day, $now_month, $now_year) = (localtime(time))[2..5];
+  $now_hour = lead_pad($now_hour, 2);
+  $now_day = lead_pad($now_day, 2);
+  $now_month = lead_pad($now_month + 1, 2);
+  $now_year = lead_pad($now_year + 1900, 4);
+  my %four_hour_map = ();
+  if (!chdir("$temp_clip_dir/$camera_mac_addr")) {
+    log_event("err", "could not chdir to $temp_clip_dir/$camera_mac_addr");
+    die;
+  }
+  my @input_file_list = sort(glob("*.avi"));
+  for my $input_file (@input_file_list) {
+    $input_file =~ m{^(\d+).avi};
+    my $input_file_timestamp = $1;
+    my ($clip_hour, $clip_day, $clip_month, $clip_year) = (localtime($input_file_timestamp))[2..5];
+    $clip_day = lead_pad($clip_day, 2);
+    $clip_month = lead_pad($clip_month + 1, 2);
+    $clip_year = lead_pad($clip_year + 1900, 4);
+    my $ymd = "$clip_year$clip_month$clip_day";
+    my $four_hour_block = int($clip_hour/4);
+    if ($ymd ge "$now_year$now_month$now_day") {
+      if ($four_hour_block >= int($now_hour/4)) {
+	# skip over clips that are in the current four hour block.
+	next;
+      }
+    }
+    push(@{$four_hour_map{$ymd . "-" . $four_hour_block}}, $input_file);
+  }
+  my $ps_handle = IO::File->new(); # IO handle for ps command.
+  local($/) = undef; # slurp in files all at once.
+  for my $four_hour_block (sort(keys(%four_hour_map))) {
+    my @partial_input_file_list = @{$four_hour_map{$four_hour_block}};
+    $four_hour_block =~ m{(\d{8})\-(\d)};
+    my $ymd = $1;
+    my $block_index = $2;
+    my $start_time = lead_pad($block_index * 4, 2) . "00";
+    my $end_time = lead_pad($block_index * 4 + 3, 2) . "59";
+    my $input_files = join(" ", @partial_input_file_list);
+    my $output_file = "$final_output_dir/$camera_mac_addr/$ymd\_$start_time-$end_time.avi";
+    $ps_handle->open("$ps_bin -eo command|"); # get a list of all currently running processes.
+    my $ps_output = <$ps_handle>;
+    $ps_handle->close();
+    # check if an existing mencoder is running on the same output file right at this instant. if not, run mencoder now.
+    # if already running, skip over. The way that an mencoder process could already be running on the same output file is
+    # that a user could have killed the parent process. Since we daemonized earlier in this function, the mencoder process
+    # would keep running until complete.
+    if ($ps_output =~ m{$mencoder_bin .* $output_file}) {
+      log_event("notice", "skipping mencoder run on $output_file due to duplicate process");
+    } else {
+      system("$mencoder_bin -really-quiet -forceidx -oac copy -ovc copy $input_files -o $output_file >/dev/null");
+      unlink(@partial_input_file_list);
+    }
+  }
+  if (!$mencoder_child_pid) {
+    # child process should exit after performing work.
+    exit();
+  }
+}
+
+# parse a config file for a single camera.
+sub parse_config($) {
+  my $config_filename = shift;
+  if (!$config_filename) {
+    die "usage: camrecord --config FILENAME [--daemon] [--writepid FILENAME]\n";
+  } elsif (!-e $config_filename) {
+    die "config file does not exist: $config_filename\n";
+  }
+  my %config_map;
+  my $file_handle = IO::File->new();
+  my $line_num = 0;
+  $file_handle->open($config_filename);
+  while(my $line = <$file_handle>) {
+    $line_num++;
+    $line =~ s/\#.*//;
+    $line =~ s/^\s*//;
+    $line =~ s/\s*$//;
+    next if (!$line);
+    my ($option, @param_list) = split(/\s+/, $line);
+    $option = lc($option);
+    if (!@param_list) {
+      die "no parameters to config option ($option) at config file line $line_num\n";
+    }
+    if (!grep {$option eq $_} @valid_config_option_list) {
+      die "invalid config option ($option) at config file line $line_num\n";
+    }
+    $config_map{$option} = \@param_list;
+  }
+  $file_handle->close();
+  if ($config_map{"connect_timeout"}) {
+    $connect_timeout = $config_map{"connect_timeout"}->[0];
+    if ($connect_timeout !~ /^\d+$/) {
+      die "connect_timeout must be a positive number\n";
+    }
+  }
+  if ($config_map{"read_timeout"}) {
+    $read_timeout = $config_map{"read_timeout"}->[0];
+    if ($read_timeout !~ /^\d+$/) {
+      die "read_timeout must be a positive number\n";
+    }
+  }
+  if ($config_map{"temp_clip_dir"}) {
+    $temp_clip_dir = $config_map{"temp_clip_dir"}->[0];
+    if (!-d $temp_clip_dir) {
+      die "temp_clip_dir must exist\n";
+    }
+  } else {
+    die "temp_clip_dir must be specified\n";
+  }
+  if ($config_map{"final_output_dir"}) {
+    $final_output_dir = $config_map{"final_output_dir"}->[0];
+    if (!-d $final_output_dir) {
+      die "final_output_dir must exist\n";
+    }
+  } else {
+    die "final_output_dir must be specified\n";
+  }
+  if ($config_map{"camera_type"}) {
+    $camera_type = $config_map{"camera_type"}->[0];
+    if (!grep {$camera_type eq $_} @valid_camera_type_list) {
+      die "invalid camera_type value ($camera_type)\n";
+    }
+  } else {
+    die "camera_type must be specified\n";
+  }
+  if ($config_map{"camera_mac_addr"}) {
+    $camera_mac_addr = $config_map{"camera_mac_addr"}->[0];
+    if ($camera_mac_addr !~ /^[0-9a-f]{12}$/) {
+      die "camera_mac_addr must be a valid MAC address\n";
+    }
+  } else {
+    die "camera_mac_addr must be specified\n";
+  }
+  if ($config_map{"camera_ip_addr"}) {
+    $camera_ip_addr = $config_map{"camera_ip_addr"}->[0];
+    if ($camera_ip_addr !~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+      die "camera_ip_addr must be a valid IP address\n";
+    }
+  } else {
+    die "camera_ip_addr must be specified\n";
+  }
+  if ($config_map{"camera_username"}) {
+    $camera_username = $config_map{"camera_username"}->[0];
+  }
+  if ($config_map{"camera_password"}) {
+    $camera_password = $config_map{"camera_password"}->[0];
+  }
+  if ($config_map{"const_rate_factor"}) {
+    $const_rate_factor = $config_map{"const_rate_factor"}->[0];
+    if ($const_rate_factor !~ /^\d+(\.\d+)?$/) {
+      die "const_rate_factor must be a positive decimal number\n";
+    }
+  }
+}
+
+# start a new session so that this child can survive the parent being killed.
+# gives the child a new process group ID equal to its own process ID (child becomes process group leader).
+sub daemonize() {
+  my $session_id = POSIX::setsid();
+  if ($session_id == -1) {
+    log_event("err", "unable to start new session: $!");
+    die;
+  }
+  chdir("/"); # a good daemon chdirs to / to allow unmounting of filesystems.
+  # a good daemon also closes stdio descriptors and reopens them to /dev/null.
+  close(STDIN);
+  close(STDOUT);
+  close(STDERR);
+  open(STDIN, "</dev/null");
+  open(STDOUT, ">/dev/null");
+  open(STDERR, ">/dev/null");
+  return;
+}
+
+sub lead_pad($$) {
+  my ($value, $num_digits) = @_;
+  if (length($value) < $num_digits) {
+    $value = "0"x($num_digits - length($value)) . $value;
+  }
+  return $value;
+}
+
+sub log_event($$) {
+  my ($log_level, $log_msg) = @_;
+  syslog($log_level, $log_msg);
+  return;
+}
+
+sub log_then_exit() {
+  log_event("notice", "caught TERM, so exiting");
+  exit();
+}

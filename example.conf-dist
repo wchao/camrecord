@@ -1,0 +1,20 @@
+# config file for a camera. best if named camera_aabbccddeeff.conf where aabbccddeeff is the MAC address of the camera.
+# the temp_clip_dir and final_output_dir directories must exist. if they do not, create them!
+
+# timeout options:
+# connect_timeout 15
+# read_timeout 10
+
+# directory options:
+temp_clip_dir /srv/camera_video/temp_clip_avi
+final_output_dir /srv/camera_video/four_hour_avi
+
+# camera options:
+camera_type axis_210
+camera_mac_addr 00408c112233
+camera_ip_addr 192.168.0.3
+# camera_username blah
+# camera_password blah
+
+# video options:
+# const_rate_factor 26.5

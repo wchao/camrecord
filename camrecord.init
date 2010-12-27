@@ -1,0 +1,120 @@
+#!/bin/sh
+#
+# camrecord     This shell script takes care of starting and stopping
+#               camrecord on RedHat or other chkconfig-based system.
+#
+# chkconfig: 345 98 02
+#
+# description: camrecord is a robust camera recording application making use of
+#              ffmpeg, mencoder, and curl.
+#
+
+# To install:
+#   copy this file to /etc/rc.d/init.d/camrecord
+#   shell> chkconfig --add camrecord
+#   shell> mkdir /etc/camrecord
+#   make .conf files in /etc/camrecord (see below)
+
+# To uninstall:
+#   run: chkconfig --del camrecord
+
+# Location of camrecord binary
+camrecord_bin="/usr/bin/camrecord"
+
+# Lock file
+lock_file="/var/lock/subsys/camrecord"
+
+# PID directory
+pid_dir="/var/run/camrecord"
+
+# Configuration directory
+conf_dir=/etc/camrecord
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Check that binary exists
+if ! [ -f $camrecord_bin ] 
+then
+  echo "camrecord binary not found"
+  exit 0
+fi
+
+# See how we were called.
+case "$1" in
+  start)
+	echo -n $"Starting camrecord: "
+
+	if [ ! -d  $pid_dir ]; then
+	    mkdir $pid_dir
+	fi
+
+	if [ -f $lock_file ]; then
+	    # we were not shut down correctly
+	    for pidf in `/bin/ls $pid_dir/*.pid 2>/dev/null`; do
+	      if [ -s $pidf ]; then
+		kill `cat $pidf` >/dev/null 2>&1
+	      fi
+	      rm -f $pidf
+	    done
+	    rm -f $lock_file
+	    sleep 2
+	fi
+
+	rm -f $pid_dir/*.pid
+	cd $conf_dir
+
+	# Start every .conf in $conf_dir
+	errors=0
+	successes=0
+	for c in `/bin/ls *.conf 2>/dev/null`; do
+	    base_name=${c%%.conf}
+	    rm -f $pid_dir/$base_name.pid
+	    $camrecord_bin --daemon --writepid $pid_dir/$base_name.pid --config $c
+	    if [ $? = 0 ]; then
+		successes=1
+	    else
+		errors=1
+	    fi
+	done
+
+	if [ $errors = 1 ]; then
+	    failure; echo
+	else
+	    success; echo
+	fi
+
+	if [ $successes = 1 ]; then
+	    touch $lock_file
+	fi
+	;;
+  stop)
+	echo -n $"Shutting down camrecord: "
+	for pidf in `/bin/ls $pid_dir/*.pid 2>/dev/null`; do
+	  if [ -s $pidf ]; then
+	    kill `cat $pidf` >/dev/null 2>&1
+	  fi
+	  rm -f $pidf
+	done
+
+	success; echo
+	rm -f $lock_file
+	;;
+  restart)
+	$0 stop
+	sleep 2
+	$0 start
+	;;
+  condrestart)
+        if [ -f $lock_file ]; then
+          $0 stop
+          sleep 2
+          $0 start
+        fi
+        ;;
+  *)
+	echo "Usage: camrecord {start|stop|restart|condrestart}"
+	exit 1
+	;;
+esac
+exit 0
