@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 # camrecord
-# version: 1.0.1
+# version: 1.0.2
 use Getopt::Long;
 use Sys::Syslog;
 use IO::File;
@@ -247,17 +247,42 @@ sub transcode_mjpeg_to_avi($$$) {
   # start a new session so that this child can survive the parent being killed.
   # lets us finish processing the current 30 second clip if the parent is killed with Ctrl-C (or if killed by other means).
   daemonize();
-  my $frame_rate = int($frame_count / $duration * 100) / 100;
-  my $output_avi_file = "$temp_clip_dir/$camera_mac_addr/" . time() . ".avi";
-  my $ffmpeg_io_handle = IO::File->new();
-  $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -v 0 -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 $output_avi_file >/dev/null 2>&1});
-  print $ffmpeg_io_handle $camera_data_copy;
-  $ffmpeg_io_handle->close();
-  if (!$ffmpeg_child_pid) {
-    # child process should exit after sending data to FFmpeg.
-    # note that parent process should have returned to main sub a few lines before this, and would not have called ffmpeg.
-    exit();
+  my $now_time = time();
+  my $fifo_file = "$temp_clip_dir/$camera_mac_addr/" . $now_time . ".fifo";
+  POSIX::mkfifo($fifo_file, 0600);
+  my $consumer_child_pid = fork();
+  if ($consumer_child_pid) {
+    # parent process responsible for feeding JPEG frames to FFmpeg.
+    my $frame_rate = int($frame_count / $duration * 100) / 100;
+    my $ffmpeg_io_handle = IO::File->new();
+    $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -v 0 -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 $fifo_file >/dev/null 2>&1});
+    $ffmpeg_io_handle->binmode();
+    print $ffmpeg_io_handle $camera_data_copy;
+    $ffmpeg_io_handle->close();
+  } else {
+    # child process responsible for consuming FFmpeg output (AVI file) and holding in memory until it can be written to disk.
+    # child process then writes AVI data to disk once it has decremented a semaphore.
+    my $output_avi_file = "$temp_clip_dir/$camera_mac_addr/" . $now_time . ".avi";
+    my $avi_data = "";
+    my $fifo_io_handle = IO::File->new();
+    $fifo_io_handle->open($fifo_file);
+    $fifo_io_handle->binmode();
+    while ($fifo_io_handle->read($avi_data, $pipe_buffer_size, length($avi_data))) {
+    }
+    $fifo_io_handle->close();
+    unlink($fifo_file);
+    # only allow $max_concurrent_ffmpeg instances of writing ffmpeg AVI output at once (to reduce disk thrashing).
+    decrement_semaphore($semaphore_num_ffmpeg);
+    my $avi_io_handle = IO::File->new();
+    $avi_io_handle->open(">$output_avi_file");
+    $avi_io_handle->binmode();
+    print $avi_io_handle $avi_data;
+    $avi_io_handle->close();
+    increment_semaphore($semaphore_num_ffmpeg);
   }
+  # child process should exit after sending data to FFmpeg.
+  # note that parent process should have returned to main sub a few lines before this, and would not have called ffmpeg.
+  exit();
 }
 
 # combine 30 second AVI segments into a 4 hour movie.

@@ -1,6 +1,6 @@
 Summary: Record video from IP cameras
 Name: camrecord
-Version: 1.0.1
+Version: 1.0.2
 Release: 1.el5
 License: GPL
 Group: Applications/Multimedia
