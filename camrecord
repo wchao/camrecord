@@ -1,5 +1,7 @@
 #!/usr/bin/perl
 
+# camrecord
+# version: 1.0.1
 use Getopt::Long;
 use Sys::Syslog;
 use IO::File;
