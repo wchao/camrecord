@@ -5,6 +5,8 @@ use Sys::Syslog;
 use IO::File;
 use Time::HiRes;
 use POSIX;
+use IPC::SysV qw(IPC_CREAT);
+use IPC::Semaphore;
 use strict;
 local($^W) = 1;
 
@@ -29,6 +31,12 @@ my $camera_password = ""; # default is no password
 my $const_rate_factor = "26.5"; # FFmpeg constant rate factor for x264 codec. default is 26.5.
 my $daemon = 0; # if set to 1, then runs in the background and disassociates from terminal.
 my $writepid_filename = ""; # if blank, do not write PID.
+my $semaphore_set; # will be initialized by get_semaphore_set().
+my @semaphore_enum_list = ("ffmpeg", "mencoder");
+my $semaphore_num_ffmpeg = 0;
+my $semaphore_num_mencoder = 1;
+my $max_concurrent_ffmpeg = 1;
+my $max_concurrent_mencoder = 1;
 
 main();
 
@@ -68,6 +76,8 @@ sub main {
   if (!-d "$final_output_dir/$camera_mac_addr") {
     mkdir("$final_output_dir/$camera_mac_addr", 0755);
   }
+  # get (or initialize if first time) semaphore set.
+  get_semaphore_set();
   my $camera_io_handle = IO::File->new();
   my $pipe_child_pid;
   my $last_combine_timestamp = 0;
@@ -313,8 +323,11 @@ sub combine_avi_segments() {
     if ($ps_output =~ m{$mencoder_bin .* $output_file}) {
       log_event("notice", "skipping mencoder run on $output_file due to duplicate process");
     } else {
+      # only allow $max_concurrent_mencoder instances of mencoder at once (to reduce disk thrashing).
+      decrement_semaphore($semaphore_num_mencoder);
       system("$mencoder_bin -really-quiet -forceidx -oac copy -ovc copy $input_files -o $output_file >/dev/null");
       unlink(@partial_input_file_list);
+      increment_semaphore($semaphore_num_mencoder);
     }
   }
   if (!$mencoder_child_pid) {
@@ -454,4 +467,59 @@ sub log_event($$) {
 sub log_then_exit() {
   log_event("notice", "caught TERM, so exiting");
   exit();
+}
+
+# get semaphore set for camrecord application (across all processes), creating it if this is the first time.
+sub get_semaphore_set() {
+  my $semaphore_set_key = IPC::SysV::ftok($final_output_dir, 1);
+  if ($semaphore_set_key == -1) {
+    log_event("err", "problem generating semaphore set key; exiting");
+    log_event("err", $!);
+    die;
+  }
+  my $num_semaphores = scalar(@semaphore_enum_list);
+  $semaphore_set = IPC::Semaphore->new($semaphore_set_key, $num_semaphores, 0600);
+  if (!$semaphore_set) {
+    # if failed to get semaphore set, that means it hasn't been created yet, so create it now.
+
+    # note there is a race condition: process X could create a new semaphore set and reset the semaphores to all 1s, then
+    # process Y could create a new semaphore set. process X then decrements the semaphore, and then process Y could reset the
+    # semaphores to 1 again. to reduce the chance of this, we sleep for 5 seconds after resetting the semaphores. It is
+    # theoretically possible, but highly unlikely that another process would wait 5 seconds between creating the semaphore set
+    # and resetting the values to 1. Creating the semaphore set only occurs once (actually can occur more than once if multiple
+    # camrecord processes are started simultaneously before the semaphore set has been created). After the semaphore set has
+    # been created, it will live until the server shuts restarts.
+
+    $semaphore_set = IPC::Semaphore->new($semaphore_set_key, $num_semaphores, 0600 | IPC_CREAT);
+    if (!$semaphore_set) {
+      log_event("err", "problem creating semaphore set; exiting");
+      die;
+    }
+    # set initial value of semaphore that limits concurrent ffmpeg processes to $max_concurrent_ffmpeg.
+    $semaphore_set->setval($semaphore_num_ffmpeg, $max_concurrent_ffmpeg);
+    # set initial value of semaphore that limits concurrent mencoder processes to $max_concurrent_mencoder.
+    $semaphore_set->setval($semaphore_num_mencoder, $max_concurrent_mencoder);
+    # reduce chance of a race condition by putting time between the steps that result in a problem.
+    sleep(5);
+  }
+}
+
+# decrement a semaphore. will block if current value is zero.
+# omit flags or set it to zero if no flags. Valid options for flags are in man page for semop (IPC_WAIT and SEM_UNDO).
+sub decrement_semaphore($;$) {
+  my ($semaphore_num, $flags) = @_;
+  if (!defined($flags)) {
+    $flags = 0;
+  }
+  $semaphore_set->op($semaphore_num, -1, $flags);
+}
+
+# increment a semaphore. never blocks.
+# omit flags or set it to zero if no flags. Valid options for flags are in man page for semop (IPC_WAIT and SEM_UNDO).
+sub increment_semaphore($;$) {
+  my ($semaphore_num, $flags) = @_;
+  if (!defined($flags)) {
+    $flags = 0;
+  }
+  $semaphore_set->op($semaphore_num, 1, $flags);
 }
