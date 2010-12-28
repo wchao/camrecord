@@ -1,0 +1,4 @@
+add audio capture and mixing into AVI for cameras (like Axis 210A) that support audio.
+add limit on concurrency of ffmpeg disk access to reduce disk thrashing.
+detect crashed mencoder by seeing if $semaphore_set->getncnt($semaphore_num) is too high. Might be unnecessary. We'll see.
+send syslog entries to a central host and add ability to notify administrator if a camera is down.
