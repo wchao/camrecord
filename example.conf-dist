@@ -10,7 +10,7 @@ temp_clip_dir /srv/camera_video/temp_clip_avi
 final_output_dir /srv/camera_video/four_hour_avi
 
 # camera options:
-camera_type axis_210
+camera_type axis_210a
 camera_mac_addr 00408c112233
 camera_ip_addr 192.168.0.3
 # camera_username blah

@@ -24,7 +24,7 @@ my $connect_timeout = 15; # timeout of curl connect. prevents hanging process. s
 my $read_timeout = 10; # timeout of read from curl process. prevents hanging process. specifies default if omitted from config.
 my $temp_clip_dir; # dir for 30 second clips.
 my $final_output_dir; # dir for four hour AVI files.
-my @valid_camera_type_list = (qw(axis_206 axis_207 axis_210 trendnet_tvip110));
+my @valid_camera_type_list = (qw(axis_206 axis_207 axis_210a trendnet_tvip110));
 my $camera_type;
 my $camera_mac_addr;
 my $camera_ip_addr;
@@ -39,6 +39,7 @@ my $semaphore_num_ffmpeg = 0;
 my $semaphore_num_mencoder = 1;
 my $max_concurrent_ffmpeg = 1;
 my $max_concurrent_mencoder = 1;
+my $debug_flag = 0;
 
 main();
 
@@ -47,7 +48,7 @@ sub main {
   local $SIG{"CHLD"} = "IGNORE"; # automatically reap child processes.
   local $SIG{"TERM"} = \&log_then_exit; # if TERM sig, first log the event, then exit.
   my $config_filename = "";
-  GetOptions("config=s" => \$config_filename, "daemon" => \$daemon, "writepid=s" => \$writepid_filename);
+  GetOptions("config=s" => \$config_filename, "daemon" => \$daemon, "writepid=s" => \$writepid_filename, "debug" => \$debug_flag);
   parse_config($config_filename);
   openlog("camrecord", "ndelay,pid", "user");
   if ($daemon) {
@@ -84,7 +85,7 @@ sub main {
   my $pipe_child_pid;
   my $last_combine_timestamp = 0;
   while(1) {
-    $pipe_child_pid = open_camera_pipe($camera_io_handle); # open pipe to camera based on camera type and other options.
+    $pipe_child_pid = open_video_pipe($camera_io_handle); # open pipe to camera based on camera type and other options.
     my $camera_data = "";
     my $unprocessed_data = "";
     my $time_marker = Time::HiRes::time();
@@ -147,8 +148,8 @@ sub main {
   }
 }
 
-# open pipe to camera based on camera type and other options.
-sub open_camera_pipe($) {
+# open pipe to camera for video based on camera type and other options.
+sub open_video_pipe($) {
   my $camera_io_handle = shift;
   my @curl_opt_list;
   push(@curl_opt_list, "--connect-timeout $connect_timeout");
@@ -251,11 +252,22 @@ sub transcode_mjpeg_to_avi($$$) {
   my $fifo_file = "$temp_clip_dir/$camera_mac_addr/" . $now_time . ".fifo";
   POSIX::mkfifo($fifo_file, 0600);
   my $consumer_child_pid = fork();
+  if (!defined($consumer_child_pid)) {
+    # fork return result is positive number (child PID) for parent process, 0 for child process.
+    # fork returns undef if the fork was unsuccessful.
+    log_event("err", "problem forking consumer child: $!");
+    die;
+  }
   if ($consumer_child_pid) {
     # parent process responsible for feeding JPEG frames to FFmpeg.
     my $frame_rate = int($frame_count / $duration * 100) / 100;
     my $ffmpeg_io_handle = IO::File->new();
-    $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -v 0 -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 $fifo_file >/dev/null 2>&1});
+    if ($debug_flag) {
+      my $debug_log_file = "$temp_clip_dir/$camera_mac_addr/" . $now_time . ".log";
+      $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 -f avi $fifo_file >$debug_log_file 2>&1});
+    } else {
+      $ffmpeg_io_handle->open(qq{|$ffmpeg_bin -v 0 -er 4 -y -r $frame_rate -f mjpeg -i pipe: -vcodec libx264 -fpre /usr/share/ffmpeg/libx264-medium.ffpreset -crf $const_rate_factor -threads 0 -f avi $fifo_file >/dev/null 2>&1});
+    }
     $ffmpeg_io_handle->binmode();
     print $ffmpeg_io_handle $camera_data_copy;
     $ffmpeg_io_handle->close();
@@ -352,7 +364,12 @@ sub combine_avi_segments() {
     } else {
       # only allow $max_concurrent_mencoder instances of mencoder at once (to reduce disk thrashing).
       decrement_semaphore($semaphore_num_mencoder);
-      system("$mencoder_bin -really-quiet -forceidx -oac copy -ovc copy $input_files -o $output_file >/dev/null");
+      if ($debug_flag) {
+	my $debug_log_file = "$final_output_dir/$camera_mac_addr/$ymd\_$start_time-$end_time.log";
+	system("$mencoder_bin -forceidx -oac copy -ovc copy $input_files -o $output_file >$debug_log_file 2>&1");
+      } else {
+	system("$mencoder_bin -really-quiet -forceidx -oac copy -ovc copy $input_files -o $output_file >/dev/null 2>&1");
+      }
       unlink(@partial_input_file_list);
       increment_semaphore($semaphore_num_mencoder);
     }
