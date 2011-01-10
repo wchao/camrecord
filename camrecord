@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 # camrecord
-# version: 1.0.2
+# version: 1.0.3
 use Getopt::Long;
 use Sys::Syslog;
 use IO::File;
@@ -384,7 +384,7 @@ sub combine_avi_segments() {
 sub parse_config($) {
   my $config_filename = shift;
   if (!$config_filename) {
-    die "usage: camrecord --config FILENAME [--daemon] [--writepid FILENAME]\n";
+    die "usage: camrecord --config FILENAME [--daemon] [--writepid FILENAME] [--debug]\n";
   } elsif (!-e $config_filename) {
     die "config file does not exist: $config_filename\n";
   }
